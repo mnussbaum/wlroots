@@ -487,6 +487,115 @@ static int dbus_event(int fd, uint32_t mask, void *data) {
 	return 1;
 }
 
+static bool contains_str(char *needle, char **haystack) {
+  int i = 0;
+  while(haystack[i]) {
+    if(strcmp(haystack[i], needle) == 0) {
+      return true;
+    }
+
+    i++;
+  }
+
+  return false;
+}
+
+static bool get_display_session(char **session_id) {
+	assert(session_id != NULL);
+	int ret;
+
+	// If there's a session active for the current process then just use that
+	ret = sd_pid_get_session(getpid(), session_id);
+	if (ret == 0) {
+		return true;
+	}
+
+	// Find any active sessions for the user if the process isn't part of an
+	// active session itself
+	ret = sd_uid_get_display(getuid(), session_id);
+	if (ret < 0 && ret != -ENODATA) {
+		wlr_log(WLR_ERROR, "Failed to get display: %s", strerror(-ret));
+		return false;
+	} else if (ret < 0) {
+		char **user_sessions = NULL;
+
+		// Check if there are any greeter sessions available
+		int user_session_count = sd_uid_get_sessions(getuid(), 1, &user_sessions);
+		if (user_session_count < 0) {
+			wlr_log(WLR_ERROR, "Failed to get sessions");
+			return false;
+		}
+
+		if (user_session_count == 0) {
+			wlr_log(WLR_ERROR, "User has no sessions");
+			return false;
+		}
+
+		char *class = NULL;
+		for (int i = 0; i < user_session_count; ++i) {
+			ret = sd_session_get_class(user_sessions[i], &class);
+			if (ret < 0) {
+				continue;
+			}
+
+			if (strcmp(class, "greeter") == 0) {
+				*session_id = strdup(user_sessions[i]);
+				break;
+			}
+		}
+
+		for (int i = 0; i < user_session_count; ++i) {
+			free(user_sessions[i]);
+		}
+		free(user_sessions);
+		free(class);
+
+		if (!session_id) {
+			wlr_log(WLR_ERROR, "Couldn't find an active session or a greeter session");
+			return false;
+		}
+	}
+
+	// Check that the available session is graphical
+	char *type = NULL;
+	ret = sd_session_get_type(*session_id, &type);
+	if (ret < 0) {
+		wlr_log(WLR_ERROR, "Couldn't get a type for session '%s': %s",
+				*session_id, strerror(-ret));
+		free(type);
+		return false;
+	}
+
+	char *graphical_session_types[] = {"wayland", "x11"};
+	if (!contains_str(type, graphical_session_types)) {
+		wlr_log(WLR_ERROR, "Session '%s' is not a graphical session (type: '%s')",
+				*session_id, type);
+		free(type);
+		return false;
+	}
+	free(type);
+
+	// Check that the session is active
+	char *state = NULL;
+	ret = sd_session_get_state(*session_id, &state);
+	if (ret < 0) {
+		wlr_log(WLR_ERROR, "Couldn't get state for session '%s': %s",
+				*session_id, strerror(-ret));
+		free(state);
+		return false;
+	}
+
+	char *active_states[] = {"active", "online", NULL};
+	if (!contains_str(state, active_states)) {
+		wlr_log(WLR_ERROR, "Session '%s' is not active", *session_id);
+		free(state);
+		return false;
+	}
+	free(state);
+
+	return true;
+}
+
 static struct wlr_session *logind_session_create(struct wl_display *disp) {
 	int ret;
 	struct logind_session *session = calloc(1, sizeof(*session));
@@ -495,9 +604,7 @@ static struct wlr_session *logind_session_create(struct wl_display *disp) {
 		return NULL;
 	}
 
-	ret = sd_pid_get_session(getpid(), &session->id);
-	if (ret < 0) {
-		wlr_log(WLR_ERROR, "Failed to get session id: %s", strerror(-ret));
+	if (!get_display_session(&session->id)) {
 		goto error;
 	}
 
